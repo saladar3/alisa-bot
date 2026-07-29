@@ -1,0 +1,13 @@
+{
+  "name": "alisa-bot",
+  "version": "1.0.0",
+  "description": "Алиса — ассистентка психолога Валерии Майкиной. Telegram-бот.",
+  "main": "alisa.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node alisa.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
