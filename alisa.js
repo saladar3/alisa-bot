@@ -142,7 +142,8 @@ async function generateAliceReply(profile, userText, startPayload) {
   try {
     const reply = await callDeepSeek(messages) || fallbackReply(profile);
     if (needsEscalation) {
-      notifyValeriaEscalation(profile, userText).catch(() => {});
+      // Реально пишем Валерии (с await — чтобы точно ушло), потом отвечаем клиенту.
+      await notifyValeriaEscalation(profile, userText).catch((e) => console.error("notify valeria:", (e && e.message) || e));
       return ensureEscalationNote(normalizeContacts(reply));
     }
     return normalizeContacts(reply);
@@ -197,7 +198,15 @@ ${startLine}
 }
 
 function detectEscalation(userText) {
-  return /скидк|возврат|рассрочк|не могу оплатить|трудност.*оплат|жалоб|возврат.*денег|пожалов|медицинск.*диагноз|срочно.*сейчас|кризис|суицид|не хочу жить/i.test(userText);
+  // Случаи, когда реально нужно спросить Валерию.
+  const moneyOrCritical = /скидк|возврат|рассрочк|не могу оплатить|трудност.*оплат|жалоб|возврат.*денег|пожалов|медицинск.*диагноз|срочно.*сейчас|кризис|суицид|не хочу жить/i.test(userText);
+
+  // Настойчивый запрос ВРЕМЕНИ ВНЕ ГРАФИКА (будни до 17:00, или клиент упирается
+  // в конкретный ранний час / «только в...», «удобно только», «другое время»).
+  // В таких случаях Алиса не решает сама — реально пишет Валерии.
+  const offHours = /удобно только|только в \d|только в \d{1,2}:\d{2}|другое время|могу только в|удобнее утром|с утра|утром в|в 9|в 10|в 11|в 12|в 13|в 14|в 15|в 16|до 17|до работы|до обеда|в обед/i.test(userText);
+
+  return Boolean(moneyOrCritical || offHours);
 }
 
 function ensureEscalationNote(reply) {
