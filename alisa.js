@@ -64,21 +64,7 @@ async function pollLoop() {
   let offset = await loadOffset();
   console.log("Алиса запущена. Начальный offset:", offset);
 
-  // Лок в S3: только ОДИН процесс должен опрашивать Telegram (иначе 409 conflict).
-  // На Render при деплое/перезапуске могут одновременно жить старый и новый процесс.
-  const lockId = "lock-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-  let amOwner = false;
-
   while (running) {
-    // Проверяем/продлеваем лок каждые ~20 сек (через цикл long-poll).
-    const lockOk = await tryAcquireLock(lockId);
-    if (lockOk) {
-      amOwner = true;
-    } else if (amOwner) {
-      // Лок перехвачен другим процессом — уступаем и завершаемся.
-      console.log("Лок перехвачен другим процессом, завершаюсь.");
-      process.exit(0);
-    }
     try {
       const updates = await getUpdates(token, offset);
       if (updates && updates.length) {
@@ -481,33 +467,6 @@ async function initKnowledge() {
   const kb = await loadKnowledge();
   rebuildKnowledgeText(kb);
   console.log("База знаний загружена, записей:", (kb.items || []).length);
-}
-
-// ===== Лок на опрос Telegram (чтобы работал только один процесс) =====
-const LOCK_KEY = "alisa/poll.lock";
-const LOCK_TTL_MS = 60 * 1000; // лок считается живым 60 сек
-
-// Пытаемся стать «владельцем» опроса. Возвращаем true, если мы владелец.
-async function tryAcquireLock(myId) {
-  const now = Date.now();
-  let current = null;
-  try {
-    const obj = await s3Request("GET", LOCK_KEY, null, null);
-    if (obj.ok) current = JSON.parse(await obj.text());
-  } catch (_) {}
-
-  // Если есть живой владелец и это не мы — уступаем.
-  if (current && current.id !== myId && (now - current.ts) < LOCK_TTL_MS) {
-    return false;
-  }
-  // Захватываем/продлеваем лок.
-  try {
-    await s3Request("PUT", LOCK_KEY, JSON.stringify({ id: myId, ts: now }), null);
-    return true;
-  } catch (e) {
-    console.error("lock error:", (e && e.message) || e);
-    return current && current.id === myId; // если не смогли записать — остаёмся владельцем только если уже были
-  }
 }
 
 async function loadProfile(chatId) {
