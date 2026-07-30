@@ -27,6 +27,12 @@ const healthServer = http.createServer((req, res) => {
 });
 healthServer.listen(PORT, () => console.log("HTTP health-сервер слушает порт " + PORT));
 
+// ===== Keep-alive: пингуем сами себя, чтобы бесплатный Render не усыплял сервис =====
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || "https://alisa-bot-56hg.onrender.com";
+setInterval(() => {
+  fetch(SELF_URL + "/").then(() => {}).catch(() => {});
+}, 5 * 60 * 1000); // каждые 5 минут
+
 const S3_ENDPOINT = "storage.yandexcloud.net";
 const S3_REGION = "ru-central1";
 const S3_BUCKET = process.env.S3_BUCKET || "maykina-results";
