@@ -15,12 +15,26 @@
  */
 
 const crypto = require("crypto");
+const http = require("http");
+
+// ===== HTTP-сервер на порту (нужен Render, чтобы считать сервис «живым») =====
+// Render требует, чтобы Web Service слушал порт. Бот — фоновый процесс, поэтому
+// поднимаем минимальный сервер: он просто отвечает 200 на любые запросы.
+const PORT = process.env.PORT || 10000;
+const healthServer = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Алиса работает");
+});
+healthServer.listen(PORT, () => console.log("HTTP health-сервер слушает порт " + PORT));
 
 const S3_ENDPOINT = "storage.yandexcloud.net";
 const S3_REGION = "ru-central1";
 const S3_BUCKET = process.env.S3_BUCKET || "maykina-results";
 const TG_API = (token) => `https://api.telegram.org/bot${token}`;
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
+
+// Кэш базы знаний (то, чему Алиса научилась от Валерии). Подгружается при старте.
+let aliceKnowledgeText = "";
 
 const VALERIA_NAME = "Валерия Майкина";
 const VALERIA_PHONE = "+79604440677";
@@ -99,6 +113,13 @@ async function processUpdate(token, upd) {
   profile.username = user.username || profile.username || "";
   profile.lastSeen = new Date().toISOString();
 
+  // Если пишет САМА Валерия (её chat_id) — это инструкции/ответы.
+  // Алиса УЧИТСЯ: сохраняет это в базу знаний и не ведёт диалог как с клиентом.
+  const valeriaId = String(process.env.VALERIA_CHAT_ID || "");
+  if (valeriaId && String(chatId) === valeriaId) {
+    return handleValeriaMessage(token, chatId, text, profile);
+  }
+
   if (text !== "/start") {
     profile.history = profile.history || [];
     profile.history.push({ role: "user", content: text, ts: Date.now() });
@@ -154,10 +175,45 @@ async function generateAliceReply(profile, userText, startPayload) {
   }
 }
 
+// ===== Обработка сообщений от САМОЙ Валерии (обучение) =====
+// Когда пишет Валерия — это либо ответ на эскалацию, либо новая инструкция/знание.
+async function handleValeriaMessage(token, chatId, text, profile) {
+  const t = (text || "").trim();
+  if (!t) return;
+
+  // Команда /забыть — очищаем базу знаний.
+  if (/^\/забыть/i.test(t)) {
+    await saveKnowledge({ items: [] });
+    await tgSend(token, chatId, "✅ База знаний очищена. Я всё забыла, Валерия.");
+    return;
+  }
+
+  // Команда /знания — показываем, что Алиса запомнила.
+  if (/^\/знания/i.test(t)) {
+    const kb = await loadKnowledge();
+    if (!kb.items || !kb.items.length) {
+      await tgSend(token, chatId, "📭 Моя база знаний пока пуста. Просто напишите мне любой ответ или правило — я запомню.");
+    } else {
+      const list = kb.items.map((it, i) => (i + 1) + ". " + it.text.slice(0, 200)).join("\n");
+      await tgSend(token, chatId, "🧠 Я запомнила (" + kb.items.length + "):\n\n" + list);
+    }
+    return;
+  }
+
+  // Сохраняем сообщение Валерии в базу знаний (учимся).
+  await addKnowledge(t);
+
+  // Если был открытый вопрос от клиента (pending) — даём Валерии подсказку.
+  await tgSend(token, chatId, "✅ Запомнила, Валерия! Буду использовать это в работе. (Напишите /знания, чтобы посмотреть, что я запомнила.)");
+}
+
 function buildAliceSystemPrompt(profile, startPayload) {
   const clientName = profile.firstName || "";
   const nameLine = clientName ? `Имя клиента (обращайся по имени, если уместно, но на «Вы»): ${clientName}.` : "";
   const startLine = startPayload ? `Клиент пришёл по специальной ссылке (например, с сайта после теста). Это уже тёплый контакт — он заинтересовался, можешь мягко раскрыть, чем Валерия ему поможет.` : "";
+
+  // База знаний — то, чему Алиса научилась от Валерии. Подставляем синхронно-кэшированно ниже.
+  const knowledgeLine = aliceKnowledgeText || "";
 
   return `Ты — Алиса, личная ассистентка психолога ${VALERIA_NAME}. Ты общаешься с потенциальными клиентами в Telegram и помогаешь им записаться на консультацию.
 
@@ -185,6 +241,12 @@ function buildAliceSystemPrompt(profile, startPayload) {
 - Веди клиента к записи естественно: узнала запрос → предложила формат → предложила слоты → подтвердила → сообщила реквизиты → договорилась о формате встречи.
 - После подтверждения времени — дай реквизиты (номер ${VALERIA_PHONE}, Озон Банк) и уточни формат встречи (WhatsApp / MAX / FaceTime / Zoom). Если выбрали Zoom — скажи, что ссылку пришлёшь ближе к консультации.
 - Если у клиента трудности с оплатой или нестандартный вопрос, который ты не можешь решить — скажи, что уточнишь у Валерии и обязательно вернёшься с ответом.
+
+ПРАВИЛО ЧЕСТНОСТИ (очень важно):
+- Если ты в чём-то НЕ уверена, не знаешь точный ответ, или вопрос выходит за твои знания/правила — НИКОГДА не выдумывай ответ и не обещай того, чего не сделала. Вместо этого честно скажи клиенту: «Я уточню у Валерии и вернусь к Вам с точным ответом» — и РЕАЛЬНО передай вопрос Валерии. Лучше честно сказать «уточню», чем соврать.
+- Если ты обещала «уточнить у Валерии» или «спрошу у Валерии» — значит ты ОБЯЗАНА передать этот вопрос Валерии. Никогда не пиши клиенту «я уже уточнила/спросила», если на самом деле не передавала вопрос. Если ответ от Валерии ещё не пришёл — скажи клиенту правду: «я передала вопрос Валерии, как только она ответит — сразу напишу Вам».
+
+${knowledgeLine}
 
 ВАЖНО:
 - Не ставь диагнозов, не давай медицинских советов, не обещай лечения. Всё про психологию — мягко, как помощь и сопровождение.
@@ -306,6 +368,56 @@ async function saveOffset(offset) {
   }
 }
 
+// ===== База знаний (чему Алиса научилась от Валерии) =====
+async function loadKnowledge() {
+  try {
+    const obj = await s3Request("GET", "alisa/knowledge.json", null, null);
+    if (obj.ok) return JSON.parse(await obj.text());
+  } catch (_) {}
+  return { items: [] };
+}
+
+async function saveKnowledge(kb) {
+  try {
+    kb.updatedAt = new Date().toISOString();
+    await s3Request("PUT", "alisa/knowledge.json", JSON.stringify(kb), null);
+    // Обновляем кэш текста для промпта.
+    rebuildKnowledgeText(kb);
+  } catch (e) {
+    console.error("saveKnowledge:", (e && e.message) || e);
+  }
+}
+
+async function addKnowledge(text) {
+  const kb = await loadKnowledge();
+  kb.items = kb.items || [];
+  // Не дублируем идентичные.
+  const exists = kb.items.some((it) => it.text === text);
+  if (!exists) {
+    kb.items.push({ text, ts: Date.now() });
+    // Держим максимум 50 записей — старые удаляем.
+    if (kb.items.length > 50) kb.items = kb.items.slice(-50);
+  }
+  await saveKnowledge(kb);
+}
+
+function rebuildKnowledgeText(kb) {
+  const items = (kb && kb.items) || [];
+  if (!items.length) {
+    aliceKnowledgeText = "";
+    return;
+  }
+  const list = items.map((it, i) => "- " + it.text.replace(/\s+/g, " ").trim().slice(0, 300)).join("\n");
+  aliceKnowledgeText = "ЧТО МНЕ УЖЕ СООБЩИЛА ВАЛЕРИЯ (учитывай это при ответах клиентам, это её правила и уточнения):\n" + list;
+}
+
+// Загружаем базу знаний в кэш при старте.
+async function initKnowledge() {
+  const kb = await loadKnowledge();
+  rebuildKnowledgeText(kb);
+  console.log("База знаний загружена, записей:", (kb.items || []).length);
+}
+
 async function loadProfile(chatId) {
   try {
     const obj = await s3Request("GET", "alisa/tg_" + chatId + ".json", null, null);
@@ -370,7 +482,7 @@ async function s3Request(method, key, body, queryParams) {
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // ===== Запуск =====
-pollLoop().catch((e) => console.error("fatal:", e));
+initKnowledge().finally(() => pollLoop().catch((e) => console.error("fatal:", e)));
 
 // Корректная остановка.
 process.on("SIGTERM", () => { running = false; });
