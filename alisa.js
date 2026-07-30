@@ -89,8 +89,17 @@ async function pollLoop() {
         await saveOffset(offset);
       }
     } catch (e) {
-      console.error("poll error:", (e && e.message) || e);
-      await sleep(2000);
+      const msg = (e && e.message) || String(e);
+      if (/409/.test(msg)) {
+        // Конфликт getUpdates: где-то ещё есть параллельный опрос (часто зомби-процесс
+        // от прошлого деплоя). НЕ молотим запросами —Telegram сам закроет старый long-poll
+        // через ~25-60 сек. Ждём долго и пробуем снова.
+        console.error("409 conflict — жду 60 сек, чтобы старый опрос закрылся");
+        await sleep(60000);
+      } else {
+        console.error("poll error:", msg);
+        await sleep(3000);
+      }
     }
   }
 }
