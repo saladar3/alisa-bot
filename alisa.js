@@ -93,6 +93,11 @@ async function getUpdates(token, offset) {
       allowed_updates: ["message", "edited_message"]
     })
   });
+  if (resp.status === 409) {
+    // 409 Conflict: другой процесс тоже зовёт getUpdates (часто при перезапуске Render).
+    // Не падаем — отступаем, старый процесс скоро умрёт, и мы продолжим.
+    throw new Error("getUpdates 409 conflict");
+  }
   if (!resp.ok) throw new Error("getUpdates HTTP " + resp.status);
   const data = await resp.json().catch(() => ({}));
   if (!data.ok) throw new Error("getUpdates not ok");
